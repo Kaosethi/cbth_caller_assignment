@@ -18,13 +18,15 @@ NO_LOGIN_WINDOWS = [
 ]
 
 # === GOOGLE SHEETS CONFIGURATION ===
-# TODO: Replace with actual Sheet IDs once available
 GOOGLE_SHEETS_CONFIG = {
-    'holiday_sheet_id': 'YOUR_HOLIDAY_SHEET_ID',
+    'holiday_sheet_id': '1fKLpkGZ6UiWfTeEV9iH7J3AFOq3cfU5gCWPdm2fpa8I',
+    'holiday_range': 'Holidays!A:A',                 # column A with header 'date'
+    'service_account_file': 'secrets/service_account.json',
+
+    # (placeholders for later features; OK to leave as-is for now)
     'caller_availability_sheet_id': 'YOUR_CALLER_AVAILABILITY_SHEET_ID',
-    'tier_a_template': 'CBTH-Tier A - {month_year}',  # e.g., "CBTH-Tier A - 08/2025"
-    'non_tier_a_template': 'CBTH-Non A - {month_year}',  # e.g., "CBTH-Non A - 08/2025"
-    'service_account_file': 'path/to/service-account-key.json'
+    'tier_a_template': 'CBTH-Tier A - {month_year}',
+    'non_tier_a_template': 'CBTH-Non A - {month_year}',
 }
 
 # === DATABASE CONFIGURATION ===
