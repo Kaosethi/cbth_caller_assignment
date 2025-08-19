@@ -1,8 +1,9 @@
 # scheduler/runner.py
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 import logging
+import os
 import pandas as pd
 
 # Settings and runtime config
@@ -25,15 +26,171 @@ from config.holidays_loader import load_holidays
 # Windowed pool builder (import explicitly from module)
 from allocator.pool import build_windowed_pool
 
+# Google Sheets low-level util for reading Compile tab
+from utils.gsheets import read_range
+
 # Configure root logger once
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+# -------------------------------
+# Inline legacy filter helpers
+# -------------------------------
+
+UNREACHABLE_STATUSES = ["ไม่รับสาย", "ติดต่อไม่ได้", "กดตัดสาย", "รับสายไม่สะดวกคุย"]
 
 def _load_holidays():
     """Fetch the list of holidays from Google Sheets (same workbook as other tabs)."""
     return load_holidays(GOOGLE_SHEETS_CONFIG)
 
+def _load_compile_df() -> pd.DataFrame:
+    """Load the Compile tab for the CURRENT workbook; expects at least Date, Username, Phone, Answer Status, Call Status, Result, History, History Date, Telesale."""
+    rng = GOOGLE_SHEETS_CONFIG["ranges"].get("compile")
+    if not rng:
+        logger.warning("No 'compile' range configured in GOOGLE_SHEETS_CONFIG['ranges']. Skipping compile-based filters.")
+        return pd.DataFrame(columns=["Date","Username","Phone","Answer Status","Call Status","Result","History","History Date","Telesale"])
+    vals = read_range(GOOGLE_SHEETS_CONFIG["service_account_file"], GOOGLE_SHEETS_CONFIG["config_sheet_id"], rng)
+    if not vals or len(vals) < 2:
+        return pd.DataFrame(columns=["Date","Username","Phone","Answer Status","Call Status","Result","History","History Date","Telesale"])
+    headers = [str(h).strip() for h in vals[0]]
+    df = pd.DataFrame(vals[1:], columns=headers)
+    # normalize expected cols even if missing
+    for col in ["Date","Username","Phone","Answer Status","Call Status","Result","History","History Date","Telesale"]:
+        if col not in df.columns:
+            df[col] = None
+    # types
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df["Username"] = df["Username"].astype(str).str.strip()
+    df["Phone"] = df["Phone"].astype(str).str.replace(" ", "").str.strip()
+    return df[["Date","Username","Phone","Answer Status","Call Status","Result","History","History Date","Telesale"]]
+
+def _month_slice(df: pd.DataFrame, today: date) -> pd.DataFrame:
+    if df.empty:
+        return df
+    start = datetime(today.year, today.month, 1)
+    mask = (df["Date"] >= pd.Timestamp(start)) & (df["Date"] <= pd.Timestamp(today))
+    return df.loc[mask]
+
+def _block_unreachable_repeat_this_month(compile_df: pd.DataFrame, today: date, min_cnt: int = 2) -> set[str]:
+    mdf = _month_slice(compile_df, today)
+    if mdf.empty:
+        return set()
+    grp = (mdf["Answer Status"].isin(UNREACHABLE_STATUSES)).groupby(mdf["Username"]).sum()
+    return set(grp[grp >= min_cnt].index.astype(str))
+
+def _block_answered_this_month(compile_df: pd.DataFrame, today: date) -> set[str]:
+    mdf = _month_slice(compile_df, today)
+    if mdf.empty:
+        return set()
+    return set(mdf.loc[mdf["Answer Status"] == "รับสาย", "Username"].astype(str).unique())
+
+def _block_invalid_number_ever(compile_df: pd.DataFrame) -> set[str]:
+    if compile_df.empty:
+        return set()
+    return set(compile_df.loc[compile_df["Result"] == "เบอร์เสีย", "Username"].astype(str).unique())
+
+def _block_not_interested_this_month(compile_df: pd.DataFrame, today: date) -> set[str]:
+    mdf = _month_slice(compile_df, today)
+    if mdf.empty:
+        return set()
+    return set(mdf.loc[mdf["Result"] == "ไม่สนใจ", "Username"].astype(str).unique())
+
+def _block_not_owner_hard(compile_df: pd.DataFrame) -> set[str]:
+    if compile_df.empty:
+        return set()
+    return set(compile_df.loc[compile_df["Result"] == "ไม่ใช่เจ้าของไอดี", "Username"].astype(str).unique())
+
+def _get_redeemed_usernames_today() -> set[str]:
+    """Query Grafana datasource DB for usernames redeemed today. Safe no-op if DB not configured."""
+    url = os.getenv("DATABASE_URL_GRAFANA")
+    use_db = os.getenv("USE_REAL_DB", "false").lower() in ("1","true","yes")
+    if not url or not use_db:
+        return set()
+    try:
+        from sqlalchemy import create_engine, text
+        eng = create_engine(url)
+        sql = text("SELECT DISTINCT username FROM redemption_logs WHERE DATE(redeem_time) = CURRENT_DATE")
+        with eng.connect() as c:
+            rows = c.execute(sql).fetchall()
+        return {r[0] for r in rows if r and r[0]}
+    except Exception as e:
+        logger.warning("Redeemed-today query skipped (error: %s).", e)
+        return set()
+
+def _normalize_reward_rank(df: pd.DataFrame) -> pd.DataFrame:
+    if "Reward Rank" in df.columns:
+        df["Reward Rank"] = df["Reward Rank"].fillna("SILVER").replace("#N/A", "SILVER")
+    return df
+
+def _apply_legacy_filters(pool_df: pd.DataFrame, compile_df: pd.DataFrame, run_date: date) -> pd.DataFrame:
+    """Apply agreed legacy filters. Uses env/config toggles when present; sane defaults otherwise."""
+    if pool_df.empty:
+        return pool_df.copy()
+
+    cfg = getattr(settings, "CONFIG", {}) or {}
+
+    def _cfg(name: str, default):
+        # Allow both settings.CONFIG and environment overrides
+        return cfg.get(name, os.getenv(name, str(default))).__str__().lower() if isinstance(default, bool) else cfg.get(name, default)
+
+    # toggles / params
+    drop_unreachable = (_cfg("DROP_UNREACHABLE_REPEAT", True) in ("true","1","yes"))
+    unreachable_min = int(_cfg("UNREACHABLE_MIN_COUNT", 2))
+    drop_answered = (_cfg("DROP_ANSWERED_THIS_MONTH", False) in ("true","1","yes"))
+    drop_invalid = (_cfg("DROP_INVALID_NUMBER", True) in ("true","1","yes"))
+    drop_not_interested = (_cfg("DROP_NOT_INTERESTED_THIS_MONTH", True) in ("true","1","yes"))
+    drop_not_owner = (_cfg("DROP_NOT_OWNER_AS_BLACKLIST", True) in ("true","1","yes"))
+    drop_redeemed_today = (_cfg("DROP_REDEEMED_TODAY", True) in ("true","1","yes"))
+
+    before = len(pool_df)
+    df = pool_df.copy()
+
+    # make sure Username column exists for matching (our pool uses lowercase 'username')
+    if "Username" not in df.columns and "username" in df.columns:
+        df["Username"] = df["username"].astype(str)
+    if "Phone" not in df.columns and "phone" in df.columns:
+        df["Phone"] = df["phone"].astype(str)
+
+    removed_total = 0
+
+    if drop_unreachable:
+        block = _block_unreachable_repeat_this_month(compile_df, run_date, unreachable_min)
+        pre = len(df); df = df[~df["Username"].astype(str).isin(block)]; removed_total += (pre - len(df))
+        logger.info("Filter unreachable(≥%d this month): removed %d", unreachable_min, pre - len(df))
+
+    if drop_answered:
+        block = _block_answered_this_month(compile_df, run_date)
+        pre = len(df); df = df[~df["Username"].astype(str).isin(block)]; removed_total += (pre - len(df))
+        logger.info("Filter answered(this month): removed %d", pre - len(df))
+
+    if drop_invalid:
+        block = _block_invalid_number_ever(compile_df)
+        pre = len(df); df = df[~df["Username"].astype(str).isin(block)]; removed_total += (pre - len(df))
+        logger.info("Filter invalid number(ever): removed %d", pre - len(df))
+
+    if drop_not_interested:
+        block = _block_not_interested_this_month(compile_df, run_date)
+        pre = len(df); df = df[~df["Username"].astype(str).isin(block)]; removed_total += (pre - len(df))
+        logger.info("Filter not interested(this month): removed %d", pre - len(df))
+
+    if drop_not_owner:
+        block = _block_not_owner_hard(compile_df)
+        pre = len(df); df = df[~df["Username"].astype(str).isin(block)]; removed_total += (pre - len(df))
+        logger.info("Filter not owner(hard): removed %d", pre - len(df))
+
+    if drop_redeemed_today:
+        redeemed = _get_redeemed_usernames_today()
+        if redeemed:
+            pre = len(df); df = df[~df["Username"].astype(str).isin(redeemed)]; removed_total += (pre - len(df))
+            logger.info("Filter redeemed today(DB): removed %d", pre - len(df))
+        else:
+            logger.info("Filter redeemed today(DB): skipped (no results or DB not enabled)")
+
+    df = _normalize_reward_rank(df)
+    logger.info("Legacy filters removed %d total (before=%d, after=%d).", removed_total, before, len(df))
+    return df
+
+# -------------------------------
 
 def run_assignment_flow(run_date: date) -> pd.DataFrame:
     """
@@ -41,6 +198,7 @@ def run_assignment_flow(run_date: date) -> pd.DataFrame:
       - Load sources/mix, callers, blacklist from Google Sheets
       - Fetch candidates from each source
       - Apply blacklist (strict triple: source_key+username+phone)
+      - Apply legacy filters (compile- & DB-driven)
       - Build windowed pool (Hot -> Cold -> Hibernated) up to target rows
       - Allocate to callers according to mix and per-caller target
     Returns: assigned DataFrame (in memory)
@@ -100,27 +258,35 @@ def run_assignment_flow(run_date: date) -> pd.DataFrame:
         logger.info("No candidates available to assign after blacklist.")
         return pd.DataFrame()
 
-    # 3) Build windowed pool up to TARGET ROWS using CONFIG["windows"]
+    # 3) NEW: Apply legacy filters (compile + redeemed-today)
+    compile_df = _load_compile_df()
+    pool_filtered = _apply_legacy_filters(pool_raw, compile_df, run_date)
+
+    if pool_filtered.empty:
+        logger.info("No candidates available after legacy filters.")
+        return pd.DataFrame()
+
+    # 4) Build windowed pool up to TARGET ROWS using CONFIG["windows"]
     target_rows = len(caller_ids) * PER_CALLER_TARGET
     windows = settings.CONFIG.get("windows", [])
 
     if not windows:
         logger.warning("No window rules found in CONFIG; skipping window filtering.")
-        pool = pool_raw.copy()
+        pool = pool_filtered.copy()
     else:
         # Guard: adapters must supply last_login_date & phone
-        missing_cols = [c for c in ("last_login_date", "phone") if c not in pool_raw.columns]
+        missing_cols = [c for c in ("last_login_date", "phone") for _ in [0] if c not in pool_filtered.columns]
         if missing_cols:
             logger.warning(
                 "Adapters did not provide required columns %s; skipping window filtering.",
                 missing_cols,
             )
-            pool = pool_raw.copy()
+            pool = pool_filtered.copy()
         else:
-            pool = build_windowed_pool(pool_raw, run_date, windows, target_rows)
+            pool = build_windowed_pool(pool_filtered, run_date, windows, target_rows)
             logger.info(
                 "Windowed pool built: %d selected / %d available (target=%d).",
-                len(pool), len(pool_raw), target_rows
+                len(pool), len(pool_filtered), target_rows
             )
             if "window_label" in pool.columns and not pool.empty:
                 logger.info("By window:\n%s", pool["window_label"].value_counts())
@@ -129,7 +295,7 @@ def run_assignment_flow(run_date: date) -> pd.DataFrame:
         logger.info("No candidates after window filtering.")
         return pd.DataFrame()
 
-    # 4) Allocate to callers according to mix and per-caller target
+    # 5) Allocate to callers according to mix and per-caller target
     from allocator.mix_allocator import allocate  # local import avoids early side-effects
     assigned = allocate(
         candidates=pool,

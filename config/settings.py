@@ -4,6 +4,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
+from dotenv import load_dotenv
+load_dotenv()
 
 # === Business rules (constants) ===
 PER_CALLER_TARGET: int = int(os.getenv("PER_CALLER_TARGET", "80"))
